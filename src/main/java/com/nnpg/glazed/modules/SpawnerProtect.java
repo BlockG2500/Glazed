@@ -17,6 +17,8 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
 import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
+import net.minecraft.network.packet.c2s.play.HandSwingC2SPacket;
+import net.minecraft.util.Hand;
 import net.minecraft.util.math.Direction;
 import net.minecraft.screen.GenericContainerScreenHandler;
 import net.minecraft.item.ItemStack;
@@ -37,6 +39,7 @@ public class SpawnerProtect extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgWhitelist = settings.createGroup("Whitelist");
     private final SettingGroup sgWebhook = settings.createGroup("Webhook");
+    private final SettingGroup sgMining = settings.createGroup("Mining");
 
     private final Setting<Boolean> webhook = sgWebhook.add(new BoolSetting.Builder()
         .name("webhook")
@@ -88,7 +91,42 @@ public class SpawnerProtect extends Module {
         .build()
     );
 
+    // mining settings
+    private final Setting<Integer> minDigTicks = sgMining.add(new IntSetting.Builder()
+        .name("min-dig-ticks")
+        .description("Minimum ticks to simulate mining a spawner (humanized)")
+        .defaultValue(22)
+        .min(1)
+        .max(200)
+        .build()
+    );
 
+    private final Setting<Integer> maxDigTicks = sgMining.add(new IntSetting.Builder()
+        .name("max-dig-ticks")
+        .description("Maximum ticks to simulate mining a spawner (humanized)")
+        .defaultValue(36)
+        .min(1)
+        .max(400)
+        .build()
+    );
+
+    private final Setting<Integer> swingInterval = sgMining.add(new IntSetting.Builder()
+        .name("swing-interval-ticks")
+        .description("How many ticks between sending swing packets while mining")
+        .defaultValue(4)
+        .min(1)
+        .max(20)
+        .build()
+    );
+
+    private final Setting<Integer> miningTimeoutTicks = sgMining.add(new IntSetting.Builder()
+        .name("mining-timeout-ticks")
+        .description("Absolute timeout (ticks) after which digging will be aborted")
+        .defaultValue(200)
+        .min(20)
+        .max(2000)
+        .build()
+    );
 
     // Whitelist settings
     private final Setting<Boolean> enableWhitelist = sgWhitelist.add(new BoolSetting.Builder()
@@ -98,13 +136,13 @@ public class SpawnerProtect extends Module {
         .build()
     );
 
-        private final Setting<List<String>> whitelistPlayers = sgWhitelist.add(new StringListSetting.Builder()
-            .name("whitelisted-players")
-            .description("List of player names to ignore")
-            .defaultValue(new ArrayList<>())
-            .visible(enableWhitelist::get)
-            .build()
-        );
+    private final Setting<List<String>> whitelistPlayers = sgWhitelist.add(new StringListSetting.Builder()
+        .name("whitelisted-players")
+        .description("List of player names to ignore")
+        .defaultValue(new ArrayList<>())
+        .visible(enableWhitelist::get)
+        .build()
+    );
 
     private enum State {
         IDLE,
@@ -129,6 +167,13 @@ public class SpawnerProtect extends Module {
     private int recheckDelay = 0;
     private int confirmDelay = 0;
     private boolean waiting = false;
+
+    // New digging fields
+    private boolean isDigging = false;
+    private BlockPos diggingPos = null;
+    private int diggingTicks = 0;
+    private int requiredDigTicks = 0;
+    private final Random random = new Random();
 
     public SpawnerProtect() {
         super(GlazedAddon.CATEGORY, "SpawnerProtect", "Breaks spawners and puts them in your inv when a player is detected");
@@ -157,6 +202,12 @@ public class SpawnerProtect extends Module {
         recheckDelay = 0;
         confirmDelay = 0;
         waiting = false;
+
+        // digging
+        isDigging = false;
+        diggingPos = null;
+        diggingTicks = 0;
+        requiredDigTicks = 0;
     }
 
     private void configureLegitMining() {
@@ -204,9 +255,6 @@ public class SpawnerProtect extends Module {
                 handleDisconnecting();
                 break;
         }
-
-        // Apply AutoReconnect setting only when needed
-        // (removed the continuous checking)
     }
 
     private void checkForPlayers() {
@@ -259,12 +307,17 @@ public class SpawnerProtect extends Module {
             }
         } else {
             lookAtBlock(currentTarget);
-            breakBlock(currentTarget);
+            // use packet-driven digging
+            if (!isDigging || !currentTarget.equals(diggingPos)) {
+                startDigging(currentTarget);
+            } else {
+                continueDigging();
+            }
 
             if (mc.world.getBlockState(currentTarget).isAir()) {
                 info("Spawner at " + currentTarget + " broken! Looking for next spawner...");
+                finishDigging(); // ensure we reset digging state and stop packets
                 currentTarget = null;
-                stopBreaking();
                 transferDelayCounter = 5;
             }
         }
@@ -290,7 +343,7 @@ public class SpawnerProtect extends Module {
         if (recheckDelay > delaySeconds.get() * 20) {
             confirmDelay++;
             if (confirmDelay >= 5) {
-                stopBreaking();
+                abortDigging();
                 spawnersMinedSuccessfully = true;
                 setSneaking(false);
                 currentState = State.GOING_TO_CHEST;
@@ -338,15 +391,155 @@ public class SpawnerProtect extends Module {
         mc.player.setPitch((float) pitch);
     }
 
-    private void breakBlock(BlockPos pos) {
-        if (mc.interactionManager != null) {
-            mc.interactionManager.updateBlockBreakingProgress(pos, Direction.UP);
-            KeyBinding.setKeyPressed(mc.options.attackKey.getDefaultKey(), true);
+    /**
+     * Start digging using packets and simulated human timing.
+     */
+    private void startDigging(BlockPos pos) {
+        if (mc.player == null || mc.getNetworkHandler() == null) return;
+
+        // Try to select a pickaxe slot (best-effort). If found, select it on client inventory.
+        int silkPickSlot = findPreferredPickSlot();
+        if (silkPickSlot >= 0) {
+            mc.player.getInventory().selectedSlot = silkPickSlot;
+        } else {
+            // optional: warn player once that no pickaxe detected
+            info("No pickaxe found in hotbar; ensure you have a silk-touch pickaxe selected.");
+        }
+
+        // send START_DESTROY_BLOCK to server
+        mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
+            PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, pos, Direction.UP
+        ));
+
+        // swing packet & client-side swing
+        try {
+            mc.getNetworkHandler().sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND));
+        } catch (Throwable ignored) {}
+        mc.player.swingHand(Hand.MAIN_HAND);
+
+        diggingPos = pos;
+        diggingTicks = 0;
+        requiredDigTicks = random.nextInt(Math.max(1, maxDigTicks.get() - minDigTicks.get() + 1)) + minDigTicks.get();
+        isDigging = true;
+
+        info("Started digging " + pos + " (will wait ~" + requiredDigTicks + " ticks)");
+    }
+
+    /**
+     * Called each tick while digging is in progress.
+     */
+    private void continueDigging() {
+        if (!isDigging || diggingPos == null || mc.interactionManager == null || mc.player == null || mc.getNetworkHandler() == null) return;
+
+        diggingTicks++;
+
+        // occasionally update client-side breaking visuals
+        if (diggingTicks % 2 == 0) {
+            mc.interactionManager.updateBlockBreakingProgress(diggingPos, Direction.UP);
+        }
+
+        // send swing every few ticks to emulate actual player animation (server-side)
+        if (diggingTicks % Math.max(1, swingInterval.get()) == 0) {
+            try {
+                mc.getNetworkHandler().sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND));
+            } catch (Throwable ignored) {}
+            mc.player.swingHand(Hand.MAIN_HAND);
+        }
+
+        // If block became air, finish
+        if (mc.world.getBlockState(diggingPos).isAir()) {
+            finishDigging();
+            return;
+        }
+
+        // If we've already surpassed our expected digging ticks but block still present, allow a reasonable timeout then abort
+        if (diggingTicks > Math.max(requiredDigTicks + 8, miningTimeoutTicks.get())) {
+            // try STOP first to be polite
+            try {
+                mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
+                    PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, diggingPos, Direction.UP
+                ));
+            } catch (Throwable ignored) {}
+            // final fallback abort
+            abortDigging();
+            info("Mining timeout on " + diggingPos + ", aborting to avoid stuck state.");
         }
     }
 
+    /**
+     * Properly finish digging: send STOP and reset digging state.
+     */
+    private void finishDigging() {
+        if (mc.player == null || mc.getNetworkHandler() == null) {
+            isDigging = false;
+            diggingPos = null;
+            diggingTicks = 0;
+            requiredDigTicks = 0;
+            return;
+        }
+
+        if (diggingPos != null) {
+            try {
+                mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
+                    PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, diggingPos, Direction.UP
+                ));
+                mc.getNetworkHandler().sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND));
+            } catch (Throwable ignored) {}
+        }
+
+        isDigging = false;
+        diggingPos = null;
+        diggingTicks = 0;
+        requiredDigTicks = 0;
+    }
+
+    /**
+     * Abort digging (abort packet) and reset internal state.
+     */
+    private void abortDigging() {
+        if (isDigging && diggingPos != null && mc.getNetworkHandler() != null) {
+            try {
+                mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
+                    PlayerActionC2SPacket.Action.ABORT_DESTROY_BLOCK, diggingPos, Direction.UP
+                ));
+            } catch (Throwable ignored) {}
+        }
+
+        isDigging = false;
+        diggingPos = null;
+        diggingTicks = 0;
+        requiredDigTicks = 0;
+    }
+
+    /**
+     * Find a "good" pickaxe slot in hotbar (best-effort): prefers netherite/diamond/iron/gold/stone/wood.
+     * Returns hotbar slot index (0-8) or -1 if none found.
+     */
+    private int findPreferredPickSlot() {
+        if (mc.player == null) return -1;
+        int[] order = new int[]{Items.NETHERITE_PICKAXE.getId(), Items.DIAMOND_PICKAXE.getId(), Items.IRON_PICKAXE.getId(), Items.GOLDEN_PICKAXE.getId(), Items.STONE_PICKAXE.getId(), Items.WOODEN_PICKAXE.getId()};
+        // We cannot reliably compare by numeric getId across mappings in every environment, so check items by equality instead:
+        for (int slot = 0; slot < 9; slot++) {
+            ItemStack s = mc.player.getInventory().getStack(slot);
+            if (s == null) continue;
+            if (s.getItem() == Items.NETHERITE_PICKAXE
+                || s.getItem() == Items.DIAMOND_PICKAXE
+                || s.getItem() == Items.IRON_PICKAXE
+                || s.getItem() == Items.GOLDEN_PICKAXE
+                || s.getItem() == Items.STONE_PICKAXE
+                || s.getItem() == Items.WOODEN_PICKAXE) {
+                return slot;
+            }
+        }
+        return -1;
+    }
+
     private void stopBreaking() {
-        KeyBinding.setKeyPressed(mc.options.attackKey.getDefaultKey(), false);
+        // stop local attack key and abort digging politely
+        try {
+            KeyBinding.setKeyPressed(mc.options.attackKey.getDefaultKey(), false);
+        } catch (Throwable ignored) {}
+        abortDigging();
     }
 
     private void setSneaking(boolean sneak) {
@@ -524,8 +717,6 @@ public class SpawnerProtect extends Module {
             }
         }).start();
     }
-
-
 
     private String createWebhookPayload(String messageContent, long discordTimestamp) {
         return String.format("""
