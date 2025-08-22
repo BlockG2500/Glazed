@@ -3,37 +3,37 @@ package com.nnpg.glazed.modules;
 import com.nnpg.glazed.GlazedAddon;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
-import meteordevelopment.meteorclient.systems.modules.Categories;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.systems.modules.Modules;
-import meteordevelopment.meteorclient.systems.modules.render.StorageESP;
 import meteordevelopment.meteorclient.utils.player.ChatUtils;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.network.AbstractClientPlayerEntity;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.entity.player.PlayerEntity;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Vec3d;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.nbt.NbtElement;
+import net.minecraft.nbt.NbtList;
+import net.minecraft.screen.GenericContainerScreenHandler;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
 import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
 import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
 import net.minecraft.network.packet.c2s.play.HandSwingC2SPacket;
 import net.minecraft.util.Hand;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
-import net.minecraft.screen.GenericContainerScreenHandler;
-import net.minecraft.item.ItemStack;
-import net.minecraft.item.Items;
+import net.minecraft.util.math.Vec3d;
 import net.minecraft.screen.slot.SlotActionType;
 import meteordevelopment.meteorclient.systems.modules.misc.AutoReconnect;
 
-import java.io.IOException;
+import java.lang.reflect.Method;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Instant;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 
 public class SpawnerProtect extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
@@ -97,7 +97,7 @@ public class SpawnerProtect extends Module {
         .description("Minimum ticks to simulate mining a spawner (humanized)")
         .defaultValue(22)
         .min(1)
-        .max(200)
+        .max(400)
         .build()
     );
 
@@ -106,7 +106,7 @@ public class SpawnerProtect extends Module {
         .description("Maximum ticks to simulate mining a spawner (humanized)")
         .defaultValue(36)
         .min(1)
-        .max(400)
+        .max(800)
         .build()
     );
 
@@ -115,16 +115,39 @@ public class SpawnerProtect extends Module {
         .description("How many ticks between sending swing packets while mining")
         .defaultValue(4)
         .min(1)
-        .max(20)
+        .max(40)
         .build()
     );
 
     private final Setting<Integer> miningTimeoutTicks = sgMining.add(new IntSetting.Builder()
         .name("mining-timeout-ticks")
         .description("Absolute timeout (ticks) after which digging will be aborted")
-        .defaultValue(200)
+        .defaultValue(220)
         .min(20)
-        .max(2000)
+        .max(4000)
+        .build()
+    );
+
+    private final Setting<Integer> resendStartInterval = sgMining.add(new IntSetting.Builder()
+        .name("resend-start-interval")
+        .description("How often (ticks) to re-send START_DESTROY_BLOCK while digging")
+        .defaultValue(8)
+        .min(1)
+        .max(40)
+        .build()
+    );
+
+    private final Setting<Boolean> requireSilkTouch = sgMining.add(new BoolSetting.Builder()
+        .name("require-silk-touch")
+        .description("If true, will only use a pick with Silk Touch; otherwise will slow mining if none found")
+        .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<Boolean> debug = sgMining.add(new BoolSetting.Builder()
+        .name("debug")
+        .description("Log packet actions for debugging")
+        .defaultValue(false)
         .build()
     );
 
@@ -168,11 +191,13 @@ public class SpawnerProtect extends Module {
     private int confirmDelay = 0;
     private boolean waiting = false;
 
-    // New digging fields
+    // Digging state
     private boolean isDigging = false;
     private BlockPos diggingPos = null;
+    private Direction diggingFace = Direction.UP;
     private int diggingTicks = 0;
     private int requiredDigTicks = 0;
+    private int lastStartResendTick = 0;
     private final Random random = new Random();
 
     public SpawnerProtect() {
@@ -203,11 +228,12 @@ public class SpawnerProtect extends Module {
         confirmDelay = 0;
         waiting = false;
 
-        // digging
         isDigging = false;
         diggingPos = null;
+        diggingFace = Direction.UP;
         diggingTicks = 0;
         requiredDigTicks = 0;
+        lastStartResendTick = 0;
     }
 
     private void configureLegitMining() {
@@ -307,7 +333,8 @@ public class SpawnerProtect extends Module {
             }
         } else {
             lookAtBlock(currentTarget);
-            // use packet-driven digging
+
+            // packet-driven digging
             if (!isDigging || !currentTarget.equals(diggingPos)) {
                 startDigging(currentTarget);
             } else {
@@ -316,15 +343,13 @@ public class SpawnerProtect extends Module {
 
             if (mc.world.getBlockState(currentTarget).isAir()) {
                 info("Spawner at " + currentTarget + " broken! Looking for next spawner...");
-                finishDigging(); // ensure we reset digging state and stop packets
+                finishDigging();
                 currentTarget = null;
                 transferDelayCounter = 5;
             }
         }
 
-        if (waiting) {
-            handleWaitingForSpawners();
-        }
+        if (waiting) handleWaitingForSpawners();
     }
 
     private void handleWaitingForSpawners() {
@@ -392,82 +417,134 @@ public class SpawnerProtect extends Module {
     }
 
     /**
-     * Start digging using packets and simulated human timing.
+     * Compute the direction (face) we are "hitting" the block from player's eye position.
+     */
+    private Direction computeHitFace(BlockPos pos) {
+        Vec3d blockCenter = Vec3d.ofCenter(pos);
+        Vec3d eye = mc.player.getEyePos();
+        Vec3d d = blockCenter.subtract(eye);
+        double ax = Math.abs(d.x);
+        double ay = Math.abs(d.y);
+        double az = Math.abs(d.z);
+
+        if (ax > ay && ax > az) {
+            return d.x > 0 ? Direction.WEST : Direction.EAST;
+        } else if (ay > ax && ay > az) {
+            return d.y > 0 ? Direction.DOWN : Direction.UP;
+        } else {
+            return d.z > 0 ? Direction.NORTH : Direction.SOUTH;
+        }
+    }
+
+    /**
+     * Start digging using packets, using computed face and occasional START resends.
      */
     private void startDigging(BlockPos pos) {
         if (mc.player == null || mc.getNetworkHandler() == null) return;
 
-        // Try to select a pickaxe slot (best-effort). If found, select it on client inventory.
-        int silkPickSlot = findPreferredPickSlot();
-        if (silkPickSlot >= 0) {
-            mc.player.getInventory().selectedSlot = silkPickSlot;
-        } else {
-            // optional: warn player once that no pickaxe detected
-            info("No pickaxe found in hotbar; ensure you have a silk-touch pickaxe selected.");
+        // attempt to select preferred silk pick (if requireSilkTouch true, only pick silk-touch)
+        int pickSlot = findPreferredPickSlot(requireSilkTouch.get());
+        if (pickSlot >= 0) mc.player.getInventory().selectedSlot = pickSlot;
+        else if (requireSilkTouch.get()) {
+            // If silk is required and none found, abort entirely to avoid dropping spawner
+            ChatUtils.error("SpawnerProtect: silk-touch pick required but not found; aborting mining.");
+            abortDigging();
+            currentTarget = null;
+            waiting = true;
+            return;
         }
 
-        // send START_DESTROY_BLOCK to server
-        mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
-            PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, pos, Direction.UP
-        ));
+        diggingFace = computeHitFace(pos);
 
-        // swing packet & client-side swing
-        try {
-            mc.getNetworkHandler().sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND));
-        } catch (Throwable ignored) {}
+        // send START_DESTROY_BLOCK
+        mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
+            PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, pos, diggingFace
+        ));
+        if (debug.get()) info("Sent START_DESTROY_BLOCK to " + pos + " face=" + diggingFace);
+
+        // swing for server-side animation
+        try { mc.getNetworkHandler().sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND)); } catch (Throwable ignored) {}
         mc.player.swingHand(Hand.MAIN_HAND);
 
         diggingPos = pos;
         diggingTicks = 0;
-        requiredDigTicks = random.nextInt(Math.max(1, maxDigTicks.get() - minDigTicks.get() + 1)) + minDigTicks.get();
-        isDigging = true;
 
-        info("Started digging " + pos + " (will wait ~" + requiredDigTicks + " ticks)");
+        // humanized required ticks between min and max; if no pick or no silk, make it longer
+        boolean hasValidPick = pickSlot >= 0;
+        boolean silkPresent = false;
+        if (hasValidPick) {
+            ItemStack s = mc.player.getInventory().getStack(pickSlot);
+            silkPresent = hasSilkTouch(s);
+        }
+        int base = random.nextInt(Math.max(1, maxDigTicks.get() - minDigTicks.get() + 1)) + minDigTicks.get();
+        if (!hasValidPick) base = Math.max(base, minDigTicks.get() + 8); // slower if no pick
+        if (!silkPresent && requireSilkTouch.get() == false) base = (int) Math.ceil(base * 1.4); // slow a bit if silk absent
+        requiredDigTicks = base;
+
+        isDigging = true;
+        lastStartResendTick = tickCounter;
+
+        if (debug.get()) info("startDigging: pos=" + pos + " requiredTicks=" + requiredDigTicks + " pickSlot=" + pickSlot + " silk=" + silkPresent);
     }
 
-    /**
-     * Called each tick while digging is in progress.
-     */
     private void continueDigging() {
-        if (!isDigging || diggingPos == null || mc.interactionManager == null || mc.player == null || mc.getNetworkHandler() == null) return;
+        if (!isDigging || diggingPos == null || mc.getNetworkHandler() == null || mc.player == null) return;
 
         diggingTicks++;
 
-        // occasionally update client-side breaking visuals
+        // resend START periodically to emulate holding the dig reliably
+        if ((tickCounter - lastStartResendTick) >= resendStartInterval.get()) {
+            mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
+                PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, diggingPos, diggingFace
+            ));
+            lastStartResendTick = tickCounter;
+            if (debug.get()) info("Resent START_DESTROY_BLOCK for " + diggingPos);
+        }
+
+        // occasionally update client-side break animation
         if (diggingTicks % 2 == 0) {
-            mc.interactionManager.updateBlockBreakingProgress(diggingPos, Direction.UP);
+            if (mc.interactionManager != null) mc.interactionManager.updateBlockBreakingProgress(diggingPos, diggingFace);
         }
 
-        // send swing every few ticks to emulate actual player animation (server-side)
+        // swing to show animation to server
         if (diggingTicks % Math.max(1, swingInterval.get()) == 0) {
-            try {
-                mc.getNetworkHandler().sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND));
-            } catch (Throwable ignored) {}
+            try { mc.getNetworkHandler().sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND)); } catch (Throwable ignored) {}
             mc.player.swingHand(Hand.MAIN_HAND);
+            if (debug.get()) info("Sent swing packet tick " + diggingTicks);
         }
 
-        // If block became air, finish
+        // If server reports the block removed, finalize
         if (mc.world.getBlockState(diggingPos).isAir()) {
+            if (debug.get()) info("World reports block air at " + diggingPos + " after " + diggingTicks + " ticks");
             finishDigging();
             return;
         }
 
-        // If we've already surpassed our expected digging ticks but block still present, allow a reasonable timeout then abort
-        if (diggingTicks > Math.max(requiredDigTicks + 8, miningTimeoutTicks.get())) {
-            // try STOP first to be polite
+        // If we reached expected dig duration, be polite: attempt STOP, but still wait for world to confirm removal
+        if (diggingTicks >= requiredDigTicks) {
+            // send STOP to indicate finish
+            mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
+                PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, diggingPos, diggingFace
+            ));
+            if (debug.get()) info("Sent STOP_DESTROY_BLOCK at " + diggingPos + " after expected ticks");
+
+            // allow small grace period for server to update world; if world not updated, we will later abort on timeout
+        }
+
+        if (diggingTicks > miningTimeoutTicks.get()) {
+            // absolute timeout — abort
             try {
                 mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
-                    PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, diggingPos, Direction.UP
+                    PlayerActionC2SPacket.Action.ABORT_DESTROY_BLOCK, diggingPos, diggingFace
                 ));
             } catch (Throwable ignored) {}
-            // final fallback abort
             abortDigging();
-            info("Mining timeout on " + diggingPos + ", aborting to avoid stuck state.");
+            if (debug.get()) info("Mining aborted due to timeout at " + diggingPos);
         }
     }
 
     /**
-     * Properly finish digging: send STOP and reset digging state.
+     * Send final STOP and reset digging state.
      */
     private void finishDigging() {
         if (mc.player == null || mc.getNetworkHandler() == null) {
@@ -481,64 +558,62 @@ public class SpawnerProtect extends Module {
         if (diggingPos != null) {
             try {
                 mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
-                    PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, diggingPos, Direction.UP
+                    PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, diggingPos, diggingFace
                 ));
-                mc.getNetworkHandler().sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND));
             } catch (Throwable ignored) {}
+            try { mc.getNetworkHandler().sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND)); } catch (Throwable ignored) {}
         }
 
         isDigging = false;
         diggingPos = null;
+        diggingFace = Direction.UP;
         diggingTicks = 0;
         requiredDigTicks = 0;
     }
 
-    /**
-     * Abort digging (abort packet) and reset internal state.
-     */
     private void abortDigging() {
         if (isDigging && diggingPos != null && mc.getNetworkHandler() != null) {
             try {
                 mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
-                    PlayerActionC2SPacket.Action.ABORT_DESTROY_BLOCK, diggingPos, Direction.UP
+                    PlayerActionC2SPacket.Action.ABORT_DESTROY_BLOCK, diggingPos, diggingFace
                 ));
             } catch (Throwable ignored) {}
         }
-
         isDigging = false;
         diggingPos = null;
+        diggingFace = Direction.UP;
         diggingTicks = 0;
         requiredDigTicks = 0;
     }
 
     /**
-     * Find a "good" pickaxe slot in hotbar (best-effort): prefers netherite/diamond/iron/gold/stone/wood.
-     * Returns hotbar slot index (0-8) or -1 if none found.
+     * Find pick slot; if silkRequired==true, only return a pick with Silk Touch enchantment.
      */
-    private int findPreferredPickSlot() {
+    private int findPreferredPickSlot(boolean silkRequired) {
         if (mc.player == null) return -1;
-        int[] order = new int[]{Items.NETHERITE_PICKAXE.getId(), Items.DIAMOND_PICKAXE.getId(), Items.IRON_PICKAXE.getId(), Items.GOLDEN_PICKAXE.getId(), Items.STONE_PICKAXE.getId(), Items.WOODEN_PICKAXE.getId()};
-        // We cannot reliably compare by numeric getId across mappings in every environment, so check items by equality instead:
         for (int slot = 0; slot < 9; slot++) {
             ItemStack s = mc.player.getInventory().getStack(slot);
-            if (s == null) continue;
+            if (s == null || s.isEmpty()) continue;
             if (s.getItem() == Items.NETHERITE_PICKAXE
                 || s.getItem() == Items.DIAMOND_PICKAXE
                 || s.getItem() == Items.IRON_PICKAXE
                 || s.getItem() == Items.GOLDEN_PICKAXE
                 || s.getItem() == Items.STONE_PICKAXE
                 || s.getItem() == Items.WOODEN_PICKAXE) {
-                return slot;
+
+                if (silkRequired) {
+                    if (hasSilkTouch(s)) return slot;
+                    else continue;
+                } else {
+                    return slot;
+                }
             }
         }
         return -1;
     }
 
     private void stopBreaking() {
-        // stop local attack key and abort digging politely
-        try {
-            KeyBinding.setKeyPressed(mc.options.attackKey.getDefaultKey(), false);
-        } catch (Throwable ignored) {}
+        try { KeyBinding.setKeyPressed(mc.options.attackKey.getDefaultKey(), false); } catch (Throwable ignored) {}
         abortDigging();
     }
 
@@ -750,6 +825,84 @@ public class SpawnerProtect extends Module {
             .replace("\n", "\\n")
             .replace("\r", "\\r")
             .replace("\t", "\\t");
+    }
+
+    /**
+     * Try common ItemStack NBT accessor method names using reflection.
+     */
+    private NbtCompound getItemNbt(ItemStack stack) {
+        if (stack == null) return null;
+
+        String[] names = new String[]{"getNbt", "getTag", "getOrCreateNbt", "getOrCreateTag"};
+        for (String name : names) {
+            try {
+                Method m = stack.getClass().getMethod(name);
+                Object res = m.invoke(stack);
+                if (res instanceof NbtCompound) return (NbtCompound) res;
+            } catch (NoSuchMethodException ignored) {
+            } catch (Throwable ignored) {
+            }
+        }
+
+        // Some mappings might expose a "tag" field
+        try {
+            java.lang.reflect.Field f = stack.getClass().getDeclaredField("tag");
+            f.setAccessible(true);
+            Object v = f.get(stack);
+            if (v instanceof NbtCompound) return (NbtCompound) v;
+        } catch (Throwable ignored) {
+        }
+
+        return null;
+    }
+
+    /**
+     * Helper to detect Silk Touch enchantment using NBT only (mapping-agnostic).
+     */
+    private boolean hasSilkTouch(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return false;
+
+        try {
+            NbtCompound nbt = getItemNbt(stack);
+            if (nbt == null) return false;
+
+            // Check top-level "Enchantments" list (typical for enchanted items)
+            NbtList enchList = nbt.getList("Enchantments", NbtElement.COMPOUND_TYPE);
+            // If none, maybe nested under "tag"
+            if ((enchList == null || enchList.isEmpty()) && nbt.contains("tag", NbtElement.COMPOUND_TYPE)) {
+                NbtCompound tag = nbt.getCompound("tag");
+                enchList = tag.getList("Enchantments", NbtElement.COMPOUND_TYPE);
+            }
+
+            // Some items might store enchantments under "Enchantments" in other places; check common fields:
+            if (enchList == null || enchList.isEmpty()) {
+                // also try "StoredEnchantments" (less likely for tools but safe)
+                if (nbt.contains("StoredEnchantments", NbtElement.LIST_TYPE)) {
+                    enchList = nbt.getList("StoredEnchantments", NbtElement.COMPOUND_TYPE);
+                } else if (nbt.contains("tag", NbtElement.COMPOUND_TYPE)) {
+                    NbtCompound tag = nbt.getCompound("tag");
+                    if (tag.contains("StoredEnchantments", NbtElement.LIST_TYPE)) {
+                        enchList = tag.getList("StoredEnchantments", NbtElement.COMPOUND_TYPE);
+                    }
+                }
+            }
+
+            if (enchList == null || enchList.isEmpty()) return false;
+
+            for (int i = 0; i < enchList.size(); i++) {
+                NbtCompound e = enchList.getCompound(i);
+                String id = e.getString("id"); // usually "minecraft:silk_touch"
+                if (id != null && id.endsWith("silk_touch")) return true;
+
+                // older/alternate format: sometimes enchantment stored by numeric id or "lvl" pair; check "id" numeric or "lvl" name
+                if (e.contains("id", NbtElement.STRING_TYPE)) {
+                    String s = e.getString("id");
+                    if (s != null && s.endsWith("silk_touch")) return true;
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        return false;
     }
 
     @Override
